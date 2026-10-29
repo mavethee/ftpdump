@@ -1,4 +1,19 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+# On macOS, if invoked with default /bin/bash (3.2), auto re-exec with modern bash if available
+if [[ -z "$BASH_VERSINFO" || "$BASH_VERSINFO" -lt 5 ]]; then
+  for bash_candidate in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null)"; do
+    if [[ -n "$bash_candidate" && -x "$bash_candidate" ]]; then
+      candidate_ver=$("$bash_candidate" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)
+      if [[ "$candidate_ver" -ge 5 ]]; then
+        exec "$bash_candidate" "$0" "$@"
+      fi
+    fi
+  done
+  echo "Error: ftpdump requires Bash 5 or newer (running ${BASH_VERSION:-unknown}). Please install it using \"brew install bash\"." >&2
+  exit 1
+fi
+
 # Dumps PS4 games via FTP connection over the network.
 # Requires cURL, GNU Wget, and a PS4 FTP server that supports SELF decryption.
 # Best results with the FTP payload from https://github.com/hippie68/ps4-ftp.
@@ -151,6 +166,7 @@ kill_downloads() {
 # $1: exit code, $2: optional message
 clean_exit() {
   local exit_code=$1
+  [[ $caffeinate_pid ]] && kill "$caffeinate_pid" 2> /dev/null
   kill $(jobs -p) 2> /dev/null
   wait
   kill_downloads
@@ -254,6 +270,18 @@ wget_error() {
 realpath() {
   echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 }
+
+# Safely creates and enters a directory by path, with retry and absolute resolution.
+safe_cd() {
+  local target_dir="$1"
+  mkdir -p "$target_dir" 2> /dev/null
+  if ! cd "$target_dir" 2> /dev/null; then
+    sleep 1
+    mkdir -p "$target_dir" 2> /dev/null
+    cd "$target_dir" || abort "Cannot access directory: \"$target_dir\"."
+  fi
+}
+
 
 # Prints an overall progress percentage in front of each download's file name
 # while dumping app/patch.
@@ -523,9 +551,8 @@ dump_dir() {
 
 # Dumps the keystone that belongs to Title ID $1.
 dump_keystone() {
-  cd "$output_dir" || abort
   echo "Dumping $title_id keystone:"
-  mkdir -p "$1-keystone" && cd "$1-keystone" || abort
+  safe_cd "$output_dir/$1-keystone"
   dump_file "$root/mnt/sandbox/pfsmnt/$1-app0/sce_sys/keystone"
   check_keystone keystone
 }
@@ -589,9 +616,8 @@ replace_np_files() {
 dump_app_data() {
   set_download_size "$root/mnt/sandbox/pfsmnt/$1-app0-nest/pfs_image.dat"
 
-  cd "$output_dir" || abort
   echo "Dumping $1 app data ($((download_size / 1000000)) MB):"
-  mkdir -p "$1-app" && cd "$1-app" || abort
+  safe_cd "$output_dir/$1-app"
 
   if [[ $pfs_extraction_enabled ]]; then
     dump_and_extract_pfs_image \
@@ -603,11 +629,13 @@ dump_app_data() {
     disable_download_progress
   fi
 
-  mkdir -p sce_sys && cd sce_sys || abort
+  safe_cd "$output_dir/$1-app/sce_sys"
   if ftp_file_exists "$root/user/app/$1/app.pkg"; then
     dump_and_extract_pkg "$root/user/app/$1/app.pkg"
   elif ftp_file_exists "$root/mnt/ext0/user/app/$1/app.pkg"; then
     dump_and_extract_pkg "$root/mnt/ext0/user/app/$1/app.pkg"
+  elif ftp_file_exists "$root/preinst2/app/$1/app.pkg"; then
+    dump_and_extract_pkg "$root/preinst2/app/$1/app.pkg"
   else
     abort "Could not find FTP file \"app.pkg\"."
   fi
@@ -641,9 +669,8 @@ dump_patch_data() {
     set_download_size \
       "$root/mnt/sandbox/pfsmnt/$1-patch0-nest/pfs_image.dat"
 
-    cd "$output_dir" || abort
     echo "Dumping $1 patch data ($((download_size / 1000000)) MB):"
-    mkdir -p "$1-patch" && cd "$1-patch" || abort
+    safe_cd "$output_dir/$1-patch"
 
     if [[ $pfs_extraction_enabled ]]; then
       dump_and_extract_pfs_image \
@@ -655,11 +682,13 @@ dump_patch_data() {
       disable_download_progress
     fi
 
-    mkdir -p sce_sys && cd sce_sys || abort
+    safe_cd "$output_dir/$1-patch/sce_sys"
     if ftp_file_exists "$root/user/patch/$1/patch.pkg"; then
       dump_and_extract_pkg "$root/user/patch/$1/patch.pkg"
     elif ftp_file_exists "$root/mnt/ext0/user/patch/$1/patch.pkg"; then
       dump_and_extract_pkg "$root/mnt/ext0/user/patch/$1/patch.pkg"
+    elif ftp_file_exists "$root/preinst2/patch/$1/patch.pkg"; then
+      dump_and_extract_pkg "$root/preinst2/patch/$1/patch.pkg"
     else
       abort "Could not find FTP file \"patch.pkg\"."
     fi
@@ -675,25 +704,87 @@ dump_patch_data() {
 
 # Dumps DLC data that belongs to Title ID $1.
 dump_dlc_data() {
-  local dlc_dirs
+  local dlc_dirs=""
   local line
+  local dir
+  local content_id
+  local dlc_pkg
 
   [[ $debug ]] && debug_message "Checking if DLC data exists."
-  while read line; do
-    if [[ $line == d*$1*-ac ]]; then
-      [[ $debug ]] && debug_message "Found DLC directory ${line##* }"
-      dlc_dirs+="${line##* } "
-    fi
-  done < <(curl $curl_options --silent "$root/mnt/sandbox/pfsmnt/")
 
-  if [[ $dlc_dirs ]]; then
-    cd "$output_dir" || abort
+  # Scan internal and external storage for DLC directories
+  for addcont_path in "$root/user/addcont/$1/" "$root/mnt/ext0/user/addcont/$1/"; do
+    while read -r line; do
+      if [[ $line =~ ^d.*[A-Za-z0-9_-]+$ ]]; then
+        local dir_name="${line##* }"
+        dir_name="${dir_name%$'\r'}"
+        if [[ -n "$dir_name" && ! " $dlc_dirs " =~ " $dir_name " ]]; then
+          [[ $debug ]] && debug_message "Found DLC directory $dir_name in $addcont_path"
+          dlc_dirs+="$dir_name "
+        fi
+      fi
+    done < <(curl $curl_options --silent "$addcont_path" 2>/dev/null)
+  done
+
+  # Fallback: also check mounted sandbox dirs if addcont paths yielded nothing
+  if [[ -z "$dlc_dirs" ]]; then
+    while read -r line; do
+      if [[ $line == d*$1*-ac* ]]; then
+        local dir_name="${line##* }"
+        dir_name="${dir_name%$'\r'}"
+        if [[ -n "$dir_name" && ! " $dlc_dirs " =~ " $dir_name " ]]; then
+          [[ $debug ]] && debug_message "Found mounted DLC directory $dir_name in pfsmnt"
+          dlc_dirs+="$dir_name "
+        fi
+      fi
+    done < <(curl $curl_options --silent "$root/mnt/sandbox/pfsmnt/" 2>/dev/null)
+  fi
+
+  if [[ -n "$dlc_dirs" ]]; then
     echo "Dumping $1 DLC data:"
-    mkdir -p "$1-dlc" && cd "$1-dlc" || abort
+    safe_cd "$output_dir/$1-dlc"
     for dir in $dlc_dirs; do
-      mkdir "$dir" && cd "$dir" || abort
-      dump_dir "$root/mnt/sandbox/pfsmnt/$dir/"
-      cd .. || abort
+      if [[ -d "$output_dir/$1-dlc/$dir" && -f "$output_dir/$1-dlc/$dir/sce_sys/param.sfo" && $resume ]]; then
+        echo "DLC \"$dir\" already dumped, skipping."
+        continue
+      fi
+
+      # Find mounted DLC dir with content ID in /mnt/sandbox/pfsmnt/
+      content_id=$(curl $curl_options --silent "$root/mnt/sandbox/pfsmnt/" | grep -i "$dir" | grep -v "nest" | head -n 1)
+      if [[ -z "$content_id" ]]; then
+        content_id=$(curl $curl_options --silent "$root/mnt/sandbox/pfsmnt/" | grep -i "$1.*-ac" | grep -v "nest" | head -n 1)
+      fi
+
+      if [[ -n "$content_id" ]]; then
+        content_id="${content_id##* }"
+        content_id="${content_id%$'\r'}"
+        echo "Found mounted DLC dir with content ID \"$content_id\""
+      else
+        echo "Could not find mounted DLC dir for \"$dir\", skipping."
+        continue
+      fi
+
+      # Locate ac.pkg
+      if ftp_file_exists "$root/user/addcont/$1/$dir/ac.pkg"; then
+        dlc_pkg="$root/user/addcont/$1/$dir/ac.pkg"
+      elif ftp_file_exists "$root/mnt/ext0/user/addcont/$1/$dir/ac.pkg"; then
+        dlc_pkg="$root/mnt/ext0/user/addcont/$1/$dir/ac.pkg"
+      elif ftp_file_exists "$root/preinst2/addcont/$1/$dir/ac.pkg"; then
+        dlc_pkg="$root/preinst2/addcont/$1/$dir/ac.pkg"
+      else
+        echo "Could not find FTP file \"ac.pkg\" for \"$dir\", skipping."
+        continue
+      fi
+
+      safe_cd "$output_dir/$1-dlc/$dir"
+      if [[ -n "$content_id" ]]; then
+        dump_dir "$root/mnt/sandbox/pfsmnt/$content_id/"
+      fi
+
+      safe_cd "$output_dir/$1-dlc/$dir/sce_sys"
+      dump_and_extract_pkg "$dlc_pkg"
+
+      safe_cd "$output_dir/$1-dlc"
     done
   else
     echo "No DLC data found for $1."
@@ -710,12 +801,11 @@ dump_pkgs() {
       for ftp_file in "$root/user/app/$title_id/app.pkg" \
         "$root/mnt/ext0/user/app/$title_id/app.pkg"; do
         if ftp_file_exists "$ftp_file"; then
-          cd "$output_dir" || abort
           set_download_size "$ftp_file" mb
           echo "Downloading $title_id app PKG ($download_size MB) ..."
-          mkdir -p "$title_id-app-pkg" && cd "$title_id-app-pkg" || abort
+          safe_cd "$output_dir/$title_id-app-pkg"
           curl $curl_options $curl_resume $curl_verbose --progress-bar \
-            --remote-name "$ftp_file" || curl_error "$ftp_file"
+            "$ftp_file" | cat > "${ftp_file##*/}" || curl_error "$ftp_file"
           ftp_file=
           break;
         fi
@@ -727,12 +817,11 @@ dump_pkgs() {
       for ftp_file in "$root/user/patch/$title_id/patch.pkg" \
         "$root/mnt/ext0/user/patch/$title_id/patch.pkg"; do
         if ftp_file_exists "$ftp_file"; then
-          cd "$output_dir" || abort
           set_download_size "$ftp_file" mb
           echo "Downloading $title_id patch PKG ($download_size MB) ..."
-          mkdir -p "$title_id-patch-pkg" && cd "$title_id-patch-pkg" || abort
+          safe_cd "$output_dir/$title_id-patch-pkg"
           curl $curl_options $curl_resume $curl_verbose --progress-bar \
-            --remote-name "$ftp_file" || curl_error "$ftp_file"
+            "$ftp_file" | cat > "${ftp_file##*/}" || curl_error "$ftp_file"
           ftp_file=
           break;
         fi
@@ -747,13 +836,11 @@ dump_pkgs() {
       while read -r dlc_dir; do
         ftp_file="$root/user/addcont/$title_id/$dlc_dir/ac.pkg"
         if ftp_file_exists "$ftp_file"; then
-          cd "$output_dir" || abort
           set_download_size "$ftp_file" mb
           echo "Downloading $title_id DLC PKG \"$dlc_dir\" ($download_size MB) ..."
-          mkdir -p "$title_id-dlc-pkg" && cd "$title_id-dlc-pkg" || abort
-          mkdir -p "$dlc_dir" && cd "$dlc_dir" || abort
+          safe_cd "$output_dir/$title_id-dlc-pkg/$dlc_dir"
           curl $curl_options $curl_resume $curl_verbose --progress-bar \
-            --remote-name "$ftp_file" || curl_error "$ftp_file"
+            "$ftp_file" | cat > "${ftp_file##*/}" || curl_error "$ftp_file"
         else
           echo "No DLC PKG found for DLC \"$dlc_dir\"."
         fi
@@ -763,13 +850,11 @@ dump_pkgs() {
       while read -r dlc_dir; do
         ftp_file="$root/mnt/ext0/user/addcont/$title_id/$dlc_dir/ac.pkg"
         if ftp_file_exists "$ftp_file"; then
-          cd "$output_dir" || abort
           set_download_size "$ftp_file" mb
           echo "Downloading $title_id DLC PKG \"$dlc_dir\" ($download_size MB) ..."
-          mkdir -p "$title_id-dlc-pkg" && cd "$title_id-dlc-pkg" || abort
-          mkdir -p "$dlc_dir" && cd "$dlc_dir" || abort
+          safe_cd "$output_dir/$title_id-dlc-pkg/$dlc_dir"
           curl $curl_options $curl_resume $curl_verbose --progress-bar \
-            --remote-name "$ftp_file" || curl_error "$ftp_file"
+            "$ftp_file" | cat > "${ftp_file##*/}" || curl_error "$ftp_file"
         else
           echo "No DLC PKG found for DLC \"$dlc_dir\"."
         fi
@@ -1011,6 +1096,7 @@ read_int_be() {
     IFS= read -rd '' byte < <(dd bs=1 count=1 skip=$(($3 + i)) if="$2" \
       2> /dev/null)
     byte=$(printf "%d" "'$byte")
+    (( byte < 0 )) && (( byte += 256 ))
     _result=$((_result + 256 ** (3 - i) * byte))
   done
 
@@ -1127,6 +1213,12 @@ extract_pkg() {
 dump_and_extract_pkg() {
   local pkg_filename=${1##*/}
 
+  # If resuming and metadata is already extracted, skip re-extracting
+  if [[ $resume && -f param.sfo ]]; then
+    [[ $debug ]] && debug_message "Resume active and param.sfo exists - skipping $pkg_filename extraction."
+    return 0
+  fi
+
   echo "Preparing extraction of $pkg_filename ..."
 
   # Test how much PKG data should be downloaded
@@ -1147,8 +1239,10 @@ dump_and_extract_pkg() {
   [[ $debug ]] && debug_message "Extracting ..."
   extract_pkg "$pkg_filename"
 
-  rm "$pkg_filename" || abort \
-    "Could not remove temporary file \"$pkg_filename\"."
+  if ! rm -f "$pkg_filename" 2> /dev/null; then
+    sleep 1
+    rm -f "$pkg_filename" 2> /dev/null || warning_message "Could not remove temporary file \"$pkg_filename\"."
+  fi
 }
 
 # PFS extraction: --------------------------------------------------------------
@@ -1171,6 +1265,7 @@ read_int_le() {
   for ((i = 0; i < $4; i++)); do
     IFS= read -rd '' byte < <(dd bs=1 count=1 skip=$(($3 + i)) if="$2" 2>/dev/null)
     byte=$(printf "%d" "'$byte")
+    (( byte < 0 )) && (( byte += 256 ))
     _result=$((_result + 256 ** i * byte))
   done
 
@@ -1316,8 +1411,7 @@ extract_pfs_image() {
 dump_and_extract_pfs_image() {
   echo "Downloading PFS image file ..."
 
-  curl $curl_options $curl_resume $curl_verbose --progress-bar --remote-name \
-    "$1" || curl_error "$1"
+  curl $curl_options $curl_resume $curl_verbose --progress-bar "$1" | cat > "pfs_image.dat" || curl_error "$1"
   extract_pfs_image "pfs_image.dat"
 
   rm "pfs_image.dat" || abort \
@@ -1351,6 +1445,8 @@ export LC_ALL=C
 # Global variables
 declare download_size
 declare output_dir
+wget_options="--timeout=60 --tries=5 "
+curl_options="--connect-timeout 15 --retry 3 "
 main_pid=$BASHPID
 
 # Get options
@@ -1447,7 +1543,12 @@ for ((i = 0; i < argc; i++)); do
       --no-decrypt) option_no_decrypt=1 ;;
       -o|--output-dir)
         if [[ $((++i)) -lt argc ]]; then
-          output_dir=$(realpath "${argv[i]}")
+          mkdir -p "${argv[i]}" 2> /dev/null
+          output_dir=$(realpath "${argv[i]}" 2> /dev/null)
+          if [[ ! -d "$output_dir" ]]; then
+            echo "Option --output-dir: Cannot access or create directory \"${argv[i]}\"." >&2
+            exit 1
+          fi
         else
           echo "Missing argument for option --output-dir." >&2
           exit 1
@@ -1489,11 +1590,9 @@ if [[ noptc -gt 1 ]]; then
 fi
 
 # Check Bash version
-bash_version=$(bash --version)
-bash_version=${bash_version#*bash, version }
-full_bash_version=${bash_version%% (*}
-bash_version=${bash_version:0:1}
-if [[ $bash_version == [0-9] ]]; then
+full_bash_version=$BASH_VERSION
+bash_version=${BASH_VERSINFO[0]}
+if [[ $bash_version == [0-9]* ]]; then
   if [[ $bash_version -ge 5 ]]; then
     [[ $debug ]] && debug_message "Bash version \"$full_bash_version\" detected."
   else
@@ -1503,8 +1602,15 @@ else
   warning_message "Could not check Bash version. Please report this if you encounter any script errors."
 fi
 
-# Check for gdd and ggrep on macOS
+# Check for gdd, ggrep, and sleep prevention on macOS
 if [[ $(uname) == Darwin ]]; then
+  # Automatically prevent system, display, and USB disk sleep while dumping
+  if [[ -x /usr/bin/caffeinate && -z "$CAFFEINATE_PID" ]]; then
+    /usr/bin/caffeinate -dis -w $$ &
+    caffeinate_pid=$!
+    export CAFFEINATE_PID=$caffeinate_pid
+    [[ $debug ]] && debug_message "Preventing macOS system and disk sleep via caffeinate (PID: $caffeinate_pid)."
+  fi
   if gdd --version &> /dev/null; then
     [[ $debug ]] && debug_message "gdd detected - using gdd instead of dd."
     dd() { gdd "$@"; }
